@@ -73,3 +73,16 @@ info:
   whisper:
     type: audio
     price_per_1_min: 0.006
+
+  gpt-4-vision-preview:
+    type: chat_image
+    name: GPT-4 Vision
+    description: Ability to <b>understand images</b>, in addition to all other GPT-4 Turbo capabilties.
+
+    price_per_1000_input_tokens: 0.01
+    price_per_1000_output_tokens: 0.03
+
+    scores:
+      smart: 5
+      fast: 4
+      cheap: 3
