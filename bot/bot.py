@@ -17,12 +17,12 @@ from telegram.ext import (
 
 import config
 from database import Database
-from bot_user import BotUser
+from bot.user_manager import UserManager
 import handlers
 
 
 # setup
-_user = BotUser(Database())
+_user = UserManager(Database())
 logger = logging.getLogger(__name__)
 
 

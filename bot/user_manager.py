@@ -8,7 +8,7 @@ import config
 from database import Database
 
 
-class BotUser:
+class UserManager:
     user_semaphores = {}
     user_tasks = {}
 

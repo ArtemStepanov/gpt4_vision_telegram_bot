@@ -14,11 +14,11 @@ from functools import wraps
 import openai_utils
 from database import Database
 
-from bot_user import BotUser
+from bot.user_manager import UserManager
 import bot
 import config
 
-_user = BotUser(Database())
+_user = UserManager(Database())
 _logger = logging.getLogger(__name__)
 
 HELP_MESSAGE = """Commands:
