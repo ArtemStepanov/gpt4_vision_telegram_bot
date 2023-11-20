@@ -1,6 +1,5 @@
 import asyncio
 from datetime import datetime
-from functools import wraps
 from telegram import Update, User
 from telegram.ext import CallbackContext
 
@@ -8,7 +7,7 @@ import config
 from database import Database
 
 
-class UserManager:
+class UserUtils:
     user_semaphores = {}
     user_tasks = {}
 

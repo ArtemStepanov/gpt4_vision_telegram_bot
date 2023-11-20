@@ -14,11 +14,11 @@ from functools import wraps
 import openai_utils
 from database import Database
 
-from bot.user_manager import UserManager
+from bot.user_utils import UserUtils
 import bot
 import config
 
-_user = UserManager(Database())
+_user = UserUtils(Database())
 _logger = logging.getLogger(__name__)
 
 HELP_MESSAGE = """Commands:
@@ -113,8 +113,7 @@ async def _message_handle_fn(
     # new dialog timeout
     if use_new_dialog_timeout:
         if (
-            datetime.now()
-            - await _user.get_last_interaction(user_id)
+            datetime.now() - await _user.get_last_interaction(user_id)
         ).seconds > config.new_dialog_timeout and len(
             await _user.get_dialog_messages(user_id)
         ) > 0:
