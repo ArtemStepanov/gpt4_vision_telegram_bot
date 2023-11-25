@@ -1,7 +1,6 @@
 import yaml
 import dotenv
 from pathlib import Path
-from typing import Dict
 
 config_dir = Path(__file__).parent.parent.resolve() / "config"
 

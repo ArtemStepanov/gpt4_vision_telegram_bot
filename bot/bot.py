@@ -17,12 +17,12 @@ from telegram.ext import (
 
 import config
 from database import Database
-from user_manager import UserManager
+from user_utils import UserUtils
 import handlers
 
 
 # setup
-_user = UserManager(Database())
+_user = UserUtils(Database())
 logger = logging.getLogger(__name__)
 
 
@@ -145,18 +145,28 @@ def run_bot() -> None:
             | filters.Chat(chat_id=group_ids)
         )
 
-    application.add_handler(CommandHandler("start", handlers.start_handle, filters=user_filter))
-    application.add_handler(CommandHandler("help", handlers.help_handle, filters=user_filter))
-
     application.add_handler(
-        CommandHandler("help_group_chat", handlers.help_group_chat_handle, filters=user_filter)
+        CommandHandler("start", handlers.start_handle, filters=user_filter)
+    )
+    application.add_handler(
+        CommandHandler("help", handlers.help_handle, filters=user_filter)
     )
 
     application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND & user_filter, handlers.message_handle)
+        CommandHandler(
+            "help_group_chat", handlers.help_group_chat_handle, filters=user_filter
+        )
     )
 
-    application.add_handler(CommandHandler("retry", handlers.retry_handle, filters=user_filter))
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND & user_filter, handlers.message_handle
+        )
+    )
+
+    application.add_handler(
+        CommandHandler("retry", handlers.retry_handle, filters=user_filter)
+    )
 
     application.add_handler(
         CommandHandler("new", handlers.new_dialog_handle, filters=user_filter)
