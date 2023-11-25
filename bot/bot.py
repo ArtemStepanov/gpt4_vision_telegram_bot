@@ -17,7 +17,7 @@ from telegram.ext import (
 
 import config
 from database import Database
-from bot.user_manager import UserManager
+from user_manager import UserManager
 import handlers
 
 
@@ -170,7 +170,7 @@ def run_bot() -> None:
     )
 
     application.add_handler(
-        MessageHandler(filters.PHOTO & user_filter, handlers.photo_message_handler)
+        MessageHandler(filters.PHOTO & user_filter, handlers.message_handle)
     )
 
     application.add_handler(

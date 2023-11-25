@@ -1,3 +1,5 @@
+import base64
+from io import BytesIO
 import config
 
 import tiktoken
@@ -22,11 +24,119 @@ class ChatGPT:
             "gpt-3.5-turbo",
             "gpt-4",
             "gpt-4-1106-preview",
+            "gpt-4-vision-preview",
         }, f"Unknown model: {model}"
         self.model = model
         self.aclient = openai.AsyncOpenAI(api_key=config.openai_api_key)
         if config.openai_api_base is not None:
             self.aclient.base_url = config.openai_api_base
+
+    async def send_vision_message(
+        self,
+        message,
+        dialog_messages=[],
+        chat_mode="vision",
+        image_buffer: BytesIO = None,
+    ):
+        if chat_mode != "vision":
+            raise ValueError(f"Chat mode {chat_mode} is not supported")
+
+        n_dialog_messages_before = len(dialog_messages)
+        answer = None
+        while answer is None:
+            try:
+                if self.model == "gpt-4-vision-preview":
+                    messages = self._generate_prompt_messages(
+                        message, dialog_messages, chat_mode, image_buffer
+                    )
+                    r = await self.aclient.chat.completions.create(
+                        model=self.model, messages=messages, **OPENAI_COMPLETION_OPTIONS
+                    )
+                    answer = r.choices[0].message.content
+                else:
+                    raise ValueError(f"Unsupported model: {self.model}")
+
+                answer = self._postprocess_answer(answer)
+                n_input_tokens, n_output_tokens = (
+                    r.usage.prompt_tokens,
+                    r.usage.completion_tokens,
+                )
+            except openai.BadRequestError as e:  # too many tokens
+                if len(dialog_messages) == 0:
+                    raise ValueError(
+                        "Dialog messages is reduced to zero, but still has too many tokens to make completion"
+                    ) from e
+
+                # forget first message in dialog_messages
+                dialog_messages = dialog_messages[1:]
+
+        n_first_dialog_messages_removed = n_dialog_messages_before - len(
+            dialog_messages
+        )
+
+        return (
+            answer,
+            (n_input_tokens, n_output_tokens),
+            n_first_dialog_messages_removed,
+        )
+
+    async def send_vision_message_stream(
+        self,
+        message,
+        dialog_messages=[],
+        chat_mode="vision",
+        image_buffer: BytesIO = None,
+    ):
+        if chat_mode != "vision":
+            raise ValueError(f"Chat mode {chat_mode} is not supported")
+
+        n_dialog_messages_before = len(dialog_messages)
+        answer = None
+        while answer is None:
+            try:
+                if self.model == "gpt-4-vision-preview":
+                    messages = self._generate_prompt_messages(
+                        message, dialog_messages, chat_mode, image_buffer
+                    )
+                    r_gen = await self.aclient.chat.completions.create(
+                        model=self.model,
+                        messages=messages,
+                        stream=True,
+                        **OPENAI_COMPLETION_OPTIONS,
+                    )
+
+                    answer = ""
+                    async for r_item in r_gen:
+                        delta = r_item.choices[0].delta
+                        if "content" in delta:
+                            answer += delta.content
+                            (
+                                n_input_tokens,
+                                n_output_tokens,
+                            ) = self._count_tokens_from_messages(
+                                messages, answer, model=self.model
+                            )
+                            n_first_dialog_messages_removed = (
+                                n_dialog_messages_before - len(dialog_messages)
+                            )
+                            yield "not_finished", answer, (
+                                n_input_tokens,
+                                n_output_tokens,
+                            ), n_first_dialog_messages_removed
+
+                answer = self._postprocess_answer(answer)
+
+            except openai.BadRequestError as e:  # too many tokens
+                if len(dialog_messages) == 0:
+                    raise e
+
+                # forget first message in dialog_messages
+                dialog_messages = dialog_messages[1:]
+
+        yield "finished", answer, (
+            n_input_tokens,
+            n_output_tokens,
+        ), n_first_dialog_messages_removed
 
     async def send_message(self, message, dialog_messages=[], chat_mode="assistant"):
         if chat_mode not in config.chat_modes.keys():
@@ -41,6 +151,7 @@ class ChatGPT:
                     "gpt-3.5-turbo",
                     "gpt-4",
                     "gpt-4-1106-preview",
+                    "gpt-4-vision-preview",
                 }:
                     messages = self._generate_prompt_messages(
                         message, dialog_messages, chat_mode
@@ -183,16 +294,42 @@ class ChatGPT:
 
         return prompt
 
-    def _generate_prompt_messages(self, message, dialog_messages, chat_mode):
+    def _encode_image(self, image_buffer: BytesIO) -> bytes:
+        return base64.b64encode(image_buffer.read()).decode("utf-8")
+
+    def _generate_prompt_messages(
+        self, message, dialog_messages, chat_mode, image_buffer: BytesIO = None
+    ):
         prompt = config.chat_modes[chat_mode]["prompt_start"]
 
-        messages = [{"role": "system", "content": prompt}]
+        messages = [{"role": "system", "content": [{"type": "text", "text": prompt}]}]
+        user_messages = {"role": "user", "content": []}
+        assistant_messages = {
+            "role": "assistant",
+            "content": [],
+        }
         for dialog_message in dialog_messages:
-            messages.append({"role": "user", "content": dialog_message["user"]})
-            messages.append({"role": "assistant", "content": dialog_message["bot"]})
-        messages.append({"role": "user", "content": message})
+            user_messages["content"].append(
+                {"type": "text", "text": dialog_message["user"]}
+            )
+            assistant_messages["content"].append(
+                {"type": "text", "text": dialog_message["bot"]}
+            )
+        user_messages["content"].append({"type": "text", "text": message})
 
-        return messages
+        if image_buffer is not None:
+            user_messages["content"].append(
+                {
+                    "type": "image",
+                    "image": self._encode_image(image_buffer),
+                }
+            )
+
+        return (
+            messages
+            + ([user_messages] if len(user_messages["content"]) > 0 else [])
+            + ([assistant_messages] if len(assistant_messages["content"]) > 0 else [])
+        )
 
     def _postprocess_answer(self, answer):
         answer = answer.strip()
@@ -213,6 +350,9 @@ class ChatGPT:
             tokens_per_message = 3
             tokens_per_name = 1
         elif model == "gpt-4-1106-preview":
+            tokens_per_message = 3
+            tokens_per_name = 1
+        elif model == "gpt-4-vision-preview":
             tokens_per_message = 3
             tokens_per_name = 1
         else:

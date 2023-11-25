@@ -78,6 +78,9 @@ class UserManager:
     async def get_current_model(self, user_id) -> str:
         return await self.db.get_user_attribute(user_id, "current_model")
 
+    async def set_current_model(self, user_id, model):
+        await self.db.set_user_attribute(user_id, "current_model", model)
+
     async def set_dialog_messages(self, user_id, messages):
         dialog_id = await self.db.get_user_attribute(user_id, "current_dialog_id")
         await self.db.set_dialog_messages(user_id, messages, dialog_id)

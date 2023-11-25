@@ -14,7 +14,7 @@ from functools import wraps
 import openai_utils
 from database import Database
 
-from bot.user_manager import UserManager
+from user_manager import UserManager
 import bot
 import config
 
@@ -49,9 +49,7 @@ For example: "{bot_username} write a poem about Telegram"
 def ensure_user_registered(func):
     @wraps(func)
     async def wrapper(update, context, *args, **kwargs):
-        await _user.register_user_if_not_exists(
-            update, context, update.message.from_user
-        )
+        await _user.register_user_if_not_exists(update, context, update.effective_user)
         return await func(update, context, *args, **kwargs)
 
     return wrapper
@@ -59,7 +57,7 @@ def ensure_user_registered(func):
 
 def update_user_interaction(func):
     async def wrapper(update: Update, context: CallbackContext, *args, **kwargs):
-        user_id = update.message.from_user.id
+        user_id = update.effective_user.id
         await _user.update_user_last_interaction(user_id)
         return await func(update, context, *args, **kwargs)
 
@@ -102,6 +100,7 @@ async def _is_previous_message_not_answered_yet(
 
 
 @ensure_user_registered
+@update_user_interaction
 async def _message_handle_fn(
     update: Update,
     context: CallbackContext,
@@ -113,8 +112,7 @@ async def _message_handle_fn(
     # new dialog timeout
     if use_new_dialog_timeout:
         if (
-            datetime.now()
-            - await _user.get_last_interaction(user_id)
+            datetime.now() - await _user.get_last_interaction(user_id)
         ).seconds > config.new_dialog_timeout and len(
             await _user.get_dialog_messages(user_id)
         ) > 0:
@@ -123,8 +121,6 @@ async def _message_handle_fn(
                 f"Starting new dialog due to timeout (<b>{config.chat_modes[chat_mode]['name']}</b> mode) ✅",
                 parse_mode=ParseMode.HTML,
             )
-
-    await _user.update_user_last_interaction(user_id)
 
     # in case of CancelledError
     n_input_tokens, n_output_tokens = 0, 0
@@ -220,14 +216,12 @@ async def _message_handle_fn(
         await _user.update_n_used_tokens(
             user_id, current_model, n_input_tokens, n_output_tokens
         )
-
     except asyncio.CancelledError:
         # note: intermediate token updates only work when enable_message_streaming=True (config.yml)
         await _user.update_n_used_tokens(
             user_id, current_model, n_input_tokens, n_output_tokens
         )
         raise
-
     except Exception as e:
         error_text = f"Something went wrong during completion. Reason: {e}"
         _logger.error(error_text)
@@ -241,6 +235,191 @@ async def _message_handle_fn(
         else:
             text = f"✍️ <i>Note:</i> Your current dialog is too long, so <b>{n_first_dialog_messages_removed} first messages</b> were removed from the context.\n Send /new command to start new dialog"
         await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+
+async def _generate_image_handle(
+    update: Update, context: CallbackContext, message=None
+):
+    if await _is_previous_message_not_answered_yet(update, context):
+        return
+
+    await update.message.chat.send_action(action="upload_photo")
+
+    message = message or update.message.text
+
+    try:
+        image_urls = await openai_utils.generate_images(
+            message, n_images=config.return_n_generated_images, size=config.image_size
+        )
+    except openai.BadRequestError as e:
+        if str(e).startswith(
+            "Your request was rejected as a result of our safety system"
+        ):
+            text = "🥲 Your request <b>doesn't comply</b> with OpenAI's usage policies.\nWhat did you write there, huh?"
+            await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+            return
+        else:
+            raise
+
+    # token usage
+    user_id = update.message.from_user.id
+    await _user.set_n_generated_images(
+        user_id,
+        config.return_n_generated_images + await _user.get_n_generated_images(user_id),
+    )
+
+    for i, image_url in enumerate(image_urls):
+        await update.message.chat.send_action(action="upload_photo")
+        await update.message.reply_photo(image_url, parse_mode=ParseMode.HTML)
+
+
+async def _vision_message_handle_fn(
+    update: Update, context: CallbackContext, use_new_dialog_timeout: bool = True
+):
+    user_id = update.message.from_user.id
+    chat_mode = await _user.get_current_chat_mode(user_id)
+    current_model = await _user.get_current_model(user_id)
+
+    if current_model != "gpt-4-vision-preview" or chat_mode != "vision":
+        await update.message.reply_text(
+            "🥲 Images processing is only available for <b>gpt-4-vision-preview</b> model and <b>vision</b> chat mode. Please change your settings in /settings",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # new dialog timeout
+    if use_new_dialog_timeout:
+        if (
+            datetime.now() - await _user.get_last_interaction(user_id)
+        ).seconds > config.new_dialog_timeout and len(
+            await _user.get_dialog_messages(user_id)
+        ) > 0:
+            await _user.start_new_dialog(user_id)
+            await update.message.reply_text(
+                f"Starting new dialog due to timeout (<b>{config.chat_modes[chat_mode]['name']}</b> mode) ✅",
+                parse_mode=ParseMode.HTML,
+            )
+
+    photo = update.message.effective_attachment[-1]
+    photo_file = await context.bot.get_file(photo.file_id)
+
+    # store file in memory, not on disk
+    buf = io.BytesIO()
+    await photo_file.download_to_memory(buf)
+    buf.name = "image.jpg"  # file extension is required
+    buf.seek(0)  # move cursor to the beginning of the buffer
+
+    # in case of CancelledError
+    n_input_tokens, n_output_tokens = 0, 0
+
+    try:
+        # send placeholder message to user
+        placeholder_message = await update.message.reply_text("...")
+        message = update.message.caption
+
+        # send typing action
+        await update.message.chat.send_action(action="typing")
+
+        if message is None or len(message) == 0:
+            await update.message.reply_text(
+                "🥲 You sent <b>empty message</b>. Please, try again!",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        dialog_messages = await _user.get_dialog_messages(user_id)
+        parse_mode = {"html": ParseMode.HTML, "markdown": ParseMode.MARKDOWN}[
+            config.chat_modes[chat_mode]["parse_mode"]
+        ]
+
+        chatgpt_instance = openai_utils.ChatGPT(model=current_model)
+        if config.enable_message_streaming:
+            gen = chatgpt_instance.send_vision_message_stream(
+                message,
+                dialog_messages=dialog_messages,
+                image_buffer=buf,
+                chat_mode=chat_mode,
+            )
+        else:
+            (
+                answer,
+                (n_input_tokens, n_output_tokens),
+                n_first_dialog_messages_removed,
+            ) = await chatgpt_instance.send_vision_message(
+                message,
+                dialog_messages=dialog_messages,
+                image_buffer=buf,
+                chat_mode=chat_mode,
+            )
+
+            async def fake_gen():
+                yield "finished", answer, (
+                    n_input_tokens,
+                    n_output_tokens,
+                ), n_first_dialog_messages_removed
+
+            gen = fake_gen()
+
+        prev_answer = ""
+        async for gen_item in gen:
+            (
+                status,
+                answer,
+                (n_input_tokens, n_output_tokens),
+                n_first_dialog_messages_removed,
+            ) = gen_item
+
+            answer = answer[:4096]  # telegram message limit
+
+            # update only when 100 new symbols are ready
+            if abs(len(answer) - len(prev_answer)) < 100 and status != "finished":
+                continue
+
+            try:
+                await context.bot.edit_message_text(
+                    answer,
+                    chat_id=placeholder_message.chat_id,
+                    message_id=placeholder_message.message_id,
+                    parse_mode=parse_mode,
+                )
+            except telegram_error.BadRequest as e:
+                if str(e).startswith("Message is not modified"):
+                    continue
+                else:
+                    await context.bot.edit_message_text(
+                        answer,
+                        chat_id=placeholder_message.chat_id,
+                        message_id=placeholder_message.message_id,
+                    )
+
+            await asyncio.sleep(0.01)  # wait a bit to avoid flooding
+
+            prev_answer = answer
+
+        # update user data
+        new_dialog_message = {
+            "user": message,
+            "bot": answer,
+            "date": datetime.now(),
+        }
+        await _user.set_dialog_messages(
+            user_id, await _user.get_dialog_messages(user_id) + [new_dialog_message]
+        )
+
+        await _user.update_n_used_tokens(
+            user_id, current_model, n_input_tokens, n_output_tokens
+        )
+    except asyncio.CancelledError:
+        # note: intermediate token updates only work when enable_message_streaming=True (config.yml)
+        await _user.update_n_used_tokens(
+            user_id, current_model, n_input_tokens, n_output_tokens
+        )
+        raise
+    except Exception as e:
+        error_text = f"Something went wrong during completion. Reason: {e}"
+        _logger.error(error_text)
+        await update.message.reply_text(error_text)
+        return
 
 
 @ensure_user_registered
@@ -329,81 +508,6 @@ async def voice_message_handle(update: Update, context: CallbackContext):
 
 @ensure_user_registered
 @update_user_interaction
-async def photo_message_handler(update: Update, context: CallbackContext):
-    raise NotImplementedError
-    # check if bot was mentioned (for group chats)
-    if not await _is_bot_mentioned(update, context):
-        return
-
-    if await _is_previous_message_not_answered_yet(update, context):
-        return
-
-    user_id = update.message.from_user.id
-
-    model = await _user.get_current_model(user_id)
-    if model != "gpt-4-vision-preview":
-        await update.message.reply_text(
-            "🥲 Images processing is only available for <b>gpt-4-vision-preview</b> model. Please change your model in /settings",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-
-    if len(update.message.photo) > 1:
-        await update.message.reply_text(
-            "🥲 <b>Multiple photos</b> are not supported", parse_mode=ParseMode.HTML
-        )
-        return
-
-    photo = update.message.photo[-1]
-    photo_file = await context.bot.get_file(photo.file_id)
-
-    # store file in memory, not on disk
-    buf = io.BytesIO()
-    await photo_file.download_to_memory(buf)
-    buf.name = "image.jpg"  # file extension is required
-    buf.seek(0)  # move cursor to the beginning of the buffer
-
-    await message_handle(update, context)
-
-
-@ensure_user_registered
-@update_user_interaction
-async def generate_image_handle(update: Update, context: CallbackContext, message=None):
-    if await _is_previous_message_not_answered_yet(update, context):
-        return
-
-    await update.message.chat.send_action(action="upload_photo")
-
-    message = message or update.message.text
-
-    try:
-        image_urls = await openai_utils.generate_images(
-            message, n_images=config.return_n_generated_images, size=config.image_size
-        )
-    except openai.BadRequestError as e:
-        if str(e).startswith(
-            "Your request was rejected as a result of our safety system"
-        ):
-            text = "🥲 Your request <b>doesn't comply</b> with OpenAI's usage policies.\nWhat did you write there, huh?"
-            await update.message.reply_text(text, parse_mode=ParseMode.HTML)
-            return
-        else:
-            raise
-
-    # token usage
-    user_id = update.message.from_user.id
-    await _user.set_n_generated_images(
-        user_id,
-        config.return_n_generated_images + await _user.get_n_generated_images(user_id),
-    )
-
-    for i, image_url in enumerate(image_urls):
-        await update.message.chat.send_action(action="upload_photo")
-        await update.message.reply_photo(image_url, parse_mode=ParseMode.HTML)
-
-
-@ensure_user_registered
-@update_user_interaction
 async def new_dialog_handle(update: Update, context: CallbackContext):
     if await _is_previous_message_not_answered_yet(update, context):
         return
@@ -475,7 +579,11 @@ async def message_handle(
     chat_mode = await _user.get_current_chat_mode(user_id)
 
     if chat_mode == "artist":
-        await generate_image_handle(update, context, message=_message)
+        await _generate_image_handle(update, context, message=_message)
+        return
+
+    if chat_mode == "vision" and update.message.photo is not None and len(update.message.photo) > 0:
+        await _vision_message_handle_fn(update, context, use_new_dialog_timeout)
         return
 
     async with _user.user_semaphores[user_id]:
@@ -546,7 +654,7 @@ async def settings_handle(update: Update, context: CallbackContext):
 
     user_id = update.message.from_user.id
 
-    text, reply_markup = bot.get_settings_menu(user_id)
+    text, reply_markup = await bot.get_settings_menu(user_id)
     await update.message.reply_text(
         text, reply_markup=reply_markup, parse_mode=ParseMode.HTML
     )
@@ -564,7 +672,7 @@ async def set_settings_handle(update: Update, context: CallbackContext):
     await _user.set_current_model(user_id, model_key)
     await _user.start_new_dialog(user_id)
 
-    text, reply_markup = bot.get_settings_menu(user_id)
+    text, reply_markup = await bot.get_settings_menu(user_id)
     try:
         await query.edit_message_text(
             text, reply_markup=reply_markup, parse_mode=ParseMode.HTML
